@@ -1,0 +1,655 @@
+---
+title: "Homewok III: SVD methods and Elections Data"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    number_sections: true
+  powerpoint_presentation: default
+author: "Jiahong JIANG"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+```
+
+**Remarque:** En raison du nombre important de graphiques, seule une minorité des résultats concernant l’analyse ont intégrés dans ce rapport HTML.
+Tous les résultats et visualisations ont été exportés dans le dossier **PCA_results/** afin d’alléger le fichier final et de préserver la lisibilité.
+
+## I. Data Extraction Pipeline
+
+To analyze voting behavior patterns across different types of elections in Paris since 2000, I designed a data pipeline that is structured, reproducible, and compatible with diverse data formats.
+
+Although the Paris open data portal provides an API and structured endpoints, **I explicitly chose to rely on cleaned Excel files as the core data source**, due to the **incompleteness and inconsistency of API-provided datasets** across election years and election types. Our approach guarantees that data access is aligned with available official documents and avoids patchiness in long-term comparative analyses.
+
+### Pipeline Design Principles
+
+-   **Directory-driven architecture**: Each election type has its own folder, subdivided by year and round (e.g., `Municipales/2020-01`).
+-   **Batch-compatible Excel I/O**: All raw data is stored in `.xls` or `.xlsx` format, downloaded directly from the Paris open data portal.
+-   **Type-specific loaders**: I implemented five distinct extractors, one for each election type:
+    -   `Présidentielles`
+    -   `Législatives`
+    -   `Régionales`
+    -   `Européennes`
+    -   `Municipales`
+-   **Robust filename parsing**: Each extractor uses pattern-matching logic (e.g., with `str_match` or `str_extract`) to retrieve year and round information from file names.
+-   **Automated storage**: Cleaned matrices are saved as `.xlsx` files in structured subfolders under `*_processed/`.
+
+### Example Output
+
+-   `Régionales_processed/vote_matrix_2015_2eme.xlsx`
+-   `Législatives_processed/2022-01/vote_matrix_Circ_11.xlsx`
+-   `Municipales_processed/2008-02/vote_matrix_Ardt_19.xlsx`
+
+I emphasize again that while a fully API-based pipeline was conceptually desirable, **data gaps and format heterogeneity in live endpoints made Excel-based pipelines a more reliable and uniform choice** for this project.
+
+------------------------------------------------------------------------
+
+## II. Data Cleaning Strategy
+
+The diversity of sources and formats requires a robust cleaning pipeline to ensure comparability and quality across datasets. Our data cleaning logic includes:
+
+### Standardizing Variables and Formats
+
+-   **Column name normalization** using `janitor::clean_names()` to ensure consistent naming across datasets (e.g., `ID_BVOTE` → `id_bvote`)
+-   **Type enforcement** (e.g., ensuring `id_bvote` is always character)
+-   **Filling missing values** only for numerical variables: all `NA`s in vote counts are converted to `0` via `mutate(across(..., replace_na(...)))`
+
+### Adding Geographic Hierarchies
+
+-   Extracting arrondissement codes from `id_bvote` (e.g., `"18-3"` → 18)
+-   Assigning each polling station to a **region_group** (`Nord-Est`, `Sud-Ouest`, etc.) based on arrondissement code
+
+### Harmonizing Voting Status Labels
+
+To avoid inconsistencies in vote category names (e.g., `"NB_BL"` vs `"NB_BL_NUL"`), I excluded all vote count columns prefixed with `nb_` and focused only on **expressed vote columns** (i.e., actual votes per candidate or list).
+
+### Optional Party Mapping
+
+A future extension of this pipeline would involve mapping candidate names to standardized party labels (e.g., `"Jean-Luc MÉLENCHON"` → `"LFI"`), particularly for cross-election comparisons. While not mandatory for matrix decomposition, this becomes relevant in PCA/CCA extensions discussed in Section III.
+
+------------------------------------------------------------------------
+
+In summary, our extraction and cleaning process was designed to be robust to filename irregularities, structurally scalable across elections, and **ultimately Excel-centric** to ensure maximal compatibility with real-world data completeness and archival formats.
+
+```{r extract-vote-matrix, message=FALSE, warning=FALSE}
+library(readxl)
+library(tidyverse)
+library(janitor)
+library(stringr)
+library(writexl)
+library(dendextend)
+dir_path <- "./Régionales"
+output_path <- "./Régionales_processed"
+if (!dir.exists(output_path)) dir.create(output_path)
+
+xlsx_files <- list.files(dir_path, pattern = "\\.xlsx$", full.names = TRUE)
+
+extract_vote_matrix <- function(file_path) {
+  meta <- str_match(file_path, "regionales-(\\d{4})-(\\d)(er|emetour)")[, 2:3]
+  year <- meta[1]
+  tour <- ifelse(meta[2] == "1", "1er", "2eme")
+  df <- read_excel(file_path) %>% clean_names()
+  vote_df <- df %>%
+    mutate(id_bvote = df$id_bvote,
+           num_circ = df$num_circ) %>%
+    relocate(id_bvote, num_circ) %>%
+    select(id_bvote, num_circ,
+           where(is.numeric)) %>%
+    select(-starts_with("nb_")) %>%
+    select(-starts_with("num_"), -starts_with("geo_"))
+
+  vote_df[is.na(vote_df)] <- 0
+  vote_df <- vote_df %>%
+    mutate(
+      arrond = as.integer(str_extract(id_bvote, "^\\d+")),
+      region_group = case_when(
+        arrond %in% c(10, 11, 18, 19, 20) ~ "Nord-Est",
+        arrond %in% c(5, 6, 7, 14, 15) ~ "Sud-Ouest",
+        arrond %in% c(1, 2, 3, 4) ~ "Centre",
+        arrond %in% c(12, 13) ~ "Sud-Est",
+        arrond %in% c(8, 16, 17) ~ "Nord-Ouest",
+        arrond == 9 ~ "Nord",
+        TRUE ~ "Autre"
+      )
+    )
+  out_name <- paste0("vote_matrix_", year, "_", tour, ".xlsx")
+  write_xlsx(vote_df, path = file.path(output_path, out_name))
+  
+  message(glue::glue("✓ Saved: {basename(file_path)} → {out_name}"))
+}
+walk(xlsx_files, extract_vote_matrix)
+
+```
+
+```{r extract-presidentielle, message=FALSE, warning=FALSE}
+dir_path <- "./Présidentielles"
+output_path <- "./Présidentielles_processed"
+if (!dir.exists(output_path)) dir.create(output_path)
+xlsx_files <- list.files(dir_path, pattern = "\\.xlsx$", full.names = TRUE)
+
+extract_vote_matrix <- function(file_path) {
+  meta <- str_match(file_path, "presidentielles[-]?([0-9]{4})[-]?(\\d)(er|emetour)")[, 2:3]
+  year <- meta[1]
+  tour <- ifelse(meta[2] == "1", "1er", "2eme")
+  df <- read_excel(file_path) %>% clean_names()
+  vote_df <- df %>%
+    mutate(id_bvote = df$id_bvote,
+           num_circ = df$num_circ) %>%
+    relocate(id_bvote, num_circ) %>%
+    select(id_bvote, num_circ,
+           where(is.numeric)) %>%
+    select(-starts_with("nb_")) %>%
+    select(-starts_with("num_"), -starts_with("geo_"))
+
+  vote_df[is.na(vote_df)] <- 0
+  vote_df <- vote_df %>%
+    mutate(
+      arrond = as.integer(str_extract(id_bvote, "^\\d+")),
+      region_group = case_when(
+        arrond %in% c(10, 11, 18, 19, 20) ~ "Nord-Est",
+        arrond %in% c(5, 6, 7, 14, 15) ~ "Sud-Ouest",
+        arrond %in% c(1, 2, 3, 4) ~ "Centre",
+        arrond %in% c(12, 13) ~ "Sud-Est",
+        arrond %in% c(8, 16, 17) ~ "Nord-Ouest",
+        arrond == 9 ~ "Nord",
+        TRUE ~ "Autre"
+      )
+    )
+  out_name <- paste0("vote_matrix_", year, "_", tour, ".xlsx")
+  write_xlsx(vote_df, path = file.path(output_path, out_name))
+  
+  message(glue::glue("✓ Saved: {basename(file_path)} → {out_name}"))
+}
+walk(xlsx_files, extract_vote_matrix)
+
+
+```
+
+```{r extract-europeennes, message=FALSE, warning=FALSE}
+
+dir_path <- "./Européennes"
+output_path <- "./Européennes_processed"
+if (!dir.exists(output_path)) dir.create(output_path)
+xlsx_files <- list.files(dir_path, pattern = "\\.xlsx$", full.names = TRUE)
+extract_vote_matrix <- function(file_path) {
+  meta <- str_match(file_path, "europeennes-([0-9]{4})")[, 2]
+  year <- meta
+  tour <- "1er"
+  
+  df <- read_excel(file_path) %>% clean_names()
+  vote_df <- df %>%
+    mutate(id_bvote = df$id_bvote,
+           num_circ = df$num_circ) %>%
+    relocate(id_bvote, num_circ) %>%
+    select(id_bvote, num_circ,
+           where(is.numeric)) %>%
+    select(-starts_with("nb_")) %>%
+    select(-starts_with("num_"), -starts_with("geo_"), 
+           -starts_with("st_"), -any_of("objectid"))
+
+  vote_df <- vote_df %>%
+    mutate(across(where(is.numeric), ~replace_na(., 0)))
+
+
+  vote_df <- vote_df %>%
+    mutate(
+      arrond = as.integer(str_extract(id_bvote, "^\\d+")),
+      region_group = case_when(
+        arrond %in% c(10, 11, 18, 19, 20) ~ "Nord-Est",
+        arrond %in% c(5, 6, 7, 14, 15) ~ "Sud-Ouest",
+        arrond %in% c(1, 2, 3, 4) ~ "Centre",
+        arrond %in% c(12, 13) ~ "Sud-Est",
+        arrond %in% c(8, 16, 17) ~ "Nord-Ouest",
+        arrond == 9 ~ "Nord",
+        TRUE ~ "Autre"
+      )
+    )
+
+  out_name <- paste0("vote_matrix_", year, "_", tour, ".xlsx")
+  write_xlsx(vote_df, path = file.path(output_path, out_name))
+  
+  message(glue::glue("✓ Saved: {basename(file_path)} → {out_name}"))
+}
+
+walk(xlsx_files, extract_vote_matrix)
+
+```
+
+```{r process-legislatives-by-circ, message=FALSE, warning=FALSE}
+library(readxl)
+library(tidyverse)
+library(janitor)
+library(stringr)
+library(writexl)
+base_dir <- "./Législatives"
+output_base <- "./Législatives_processed"
+round_dirs <- list.dirs(base_dir, full.names = TRUE, recursive = FALSE)
+process_one_circ_file <- function(file_path, out_dir) {
+  file_name <- basename(file_path)
+  circ_id <- str_extract(file_name, "Circ_\\d{2}")
+  df <- read_excel(file_path) %>%
+    clean_names() %>%
+    mutate(id_bvote = as.character(id_bvote))
+  vote_df <- df %>%
+    mutate(num_circ = num_circ) %>%
+    relocate(id_bvote, num_circ) %>%
+    select(id_bvote, num_circ, where(is.numeric)) %>%
+    select(-starts_with("nb_")) %>%
+    select(-starts_with("num_"), -starts_with("geo_")) %>%
+    mutate(across(where(is.numeric), ~replace_na(., 0)))
+  out_name <- paste0("vote_matrix_", circ_id, ".xlsx")
+  write_xlsx(vote_df, path = file.path(out_dir, out_name))
+  message(glue::glue("✓ Saved: {out_name}"))
+}
+process_legislative_round <- function(round_path) {
+  round_name <- basename(round_path)
+  year <- str_extract(round_name, "\\d{4}")
+  tour <- ifelse(str_detect(round_name, "-01"), "1er", "2eme")
+  
+  message(glue::glue("▶ Processing: {round_name}"))
+  out_dir <- file.path(output_base, round_name)
+  if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
+  files <- list.files(round_path, pattern = "\\.xls[x]?$", full.names = TRUE)
+  walk(files, ~process_one_circ_file(.x, out_dir))
+}
+walk(round_dirs, process_legislative_round)
+
+```
+
+```{r process-municipales-by-arrdt, warning=FALSE}
+library(readxl)
+library(tidyverse)
+library(janitor)
+library(stringr)
+library(writexl)
+base_dir <- "./Municipales"
+output_base <- "./Municipales_processed"
+if (!dir.exists(output_base)) dir.create(output_base)
+round_dirs <- list.dirs(base_dir, full.names = TRUE, recursive = FALSE)
+process_one_ardt_file <- function(file_path, out_dir) {
+  file_name <- basename(file_path)
+  ardt_id <- str_extract(file_name, "Ardt_\\d{2}")
+  
+  df <- read_excel(file_path) %>%
+    clean_names() %>%
+    mutate(id_bvote = as.character(id_bvote))
+  
+  vote_df <- df %>%
+    mutate(num_arrond = num_arrond) %>%
+    relocate(id_bvote, num_arrond) %>%
+    select(id_bvote, num_arrond, where(is.numeric)) %>%
+    select(-starts_with("nb_")) %>%
+    select(-starts_with("num_"), -starts_with("geo_")) %>%
+    mutate(across(where(is.numeric), ~replace_na(., 0)))
+  
+  out_name <- paste0("vote_matrix_", ardt_id, ".xlsx")
+  write_xlsx(vote_df, path = file.path(out_dir, out_name))
+  message(glue::glue("✓ Saved: {out_name}"))
+}
+process_municipales_round <- function(round_path) {
+  round_name <- basename(round_path)
+  out_dir <- file.path(output_base, round_name)
+  if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
+
+  message(glue::glue("▶ Processing: {round_name}"))
+
+  files <- list.files(round_path, pattern = "\\.xls[x]?$", full.names = TRUE)
+  walk(files, ~process_one_ardt_file(.x, out_dir))
+}
+
+walk(round_dirs, process_municipales_round)
+
+```
+
+## PCA Analysis
+
+I conducted principal component analysis (PCA) on the first round of the 2017 and 2022 presidential elections in Paris to assess the structure and stability of voter preferences. These two elections featured the same leading candidates—Emmanuel Macron and Marine Le Pen—providing a natural comparison. In both years, the first principal component (PC1) explained over one-third of the variance, and the variable plots consistently revealed a dominant ideological axis opposing Macron (center) and Le Pen (far-right). Despite the emergence of new candidates in 2022, the PCA results showed a remarkably stable structure, suggesting that the underlying political space and polarization patterns in Paris remained largely unchanged across these two electoral cycles.
+
+```{r , warning=FALSE}
+
+library(tidyverse)
+library(readxl)
+library(janitor)
+library(FactoMineR)
+library(factoextra)
+library(writexl)
+do_pca <- function(data_path, output_prefix, id_col = "id_bvote") {
+  message("Loading: ", data_path)
+  df <- read_excel(data_path) %>% clean_names()
+  data_matrix <- df %>%
+    select(where(is.numeric)) %>%
+    select(-starts_with("num_"), -starts_with("arrond"), -starts_with("geo_"))
+
+  rownames(data_matrix) <- df[[id_col]]
+  pca_result <- PCA(data_matrix, graph = FALSE)
+  print(fviz_eig(pca_result, addlabels = TRUE, ylim = c(0, 50)))
+  print(fviz_pca_ind(pca_result, repel = TRUE)) 
+  print(fviz_pca_var(pca_result, col.var = "contrib",                    
+                     gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"),
+                     repel = TRUE))
+
+  write_xlsx(as.data.frame(pca_result$var$contrib), path = paste0(output_prefix, "_var_contrib.xlsx"))
+  write_xlsx(as.data.frame(pca_result$ind$coord), path = paste0(output_prefix, "_ind_coord.xlsx"))
+}
+
+files <- list.files("./Présidentielles_processed", full.names = TRUE, pattern = "\\.xlsx$")
+selected <- files[str_detect(files, "2017_1er|2022_1er")]
+print(selected)
+walk(
+  selected,
+  ~do_pca(.x, output_prefix = file.path("./PCA_results/Présidentielles", tools::file_path_sans_ext(basename(.x))))
+)
+
+```
+
+I performed PCA on the legislative election data at the constituency level to assess whether the vote distributions exhibit clear groupings or extreme outliers across polling stations. In most constituencies, the first two principal components explain a modest proportion of the variance (typically 25–30%), and the resulting individual plots show relatively compact clusters without pronounced extremities. While some constituencies display mild elongation along specific axes, indicating potential latent polarization, I do not observe distinct subgroups or isolated voting stations. This suggests that legislative voting behavior in Paris tends to be moderately structured, but lacks strong clustering or extreme anomalies.
+
+```{r , warning=FALSE}
+# PCA for Législatives: Check if PCA Shows Clear Clustering or Extremes
+input_base <- "./Législatives_processed"
+output_base <- "./PCA_results/Législatives"
+dir.create(output_base, recursive = TRUE, showWarnings = FALSE)
+round_dirs <- list.dirs(input_base, full.names = TRUE, recursive = FALSE)
+do_leg_pca <- function(file_path, output_dir) {
+  df <- read_excel(file_path) %>%
+  clean_names() %>%
+  filter(!is.na(id_bvote))
+
+  circ <- tools::file_path_sans_ext(basename(file_path))
+  vote_matrix <- df %>%
+    select(where(is.numeric)) %>%
+    select(-starts_with("num_")) %>%
+    mutate(across(everything(), ~replace_na(., 0))) %>%
+    as.data.frame()
+
+  rownames(vote_matrix) <- df$id_bvote
+  pca_res <- PCA(vote_matrix, graph = FALSE)
+
+  g_ind <- fviz_pca_ind(pca_res, repel = TRUE, title = paste0("Législatives PCA - ", circ))
+  ggsave(file.path(output_dir, paste0(circ, "_individuals.png")), g_ind, width = 6.5, height = 5)
+  g_scree <- fviz_eig(pca_res, addlabels = TRUE, ylim = c(0, 50))
+  ggsave(file.path(output_dir, paste0(circ, "_screeplot.png")), g_scree, width = 6, height = 4)
+  write_xlsx(as.data.frame(pca_res$ind$coord), path = file.path(output_dir, paste0(circ, "_ind_coord.xlsx")))
+
+  message("✓ PCA: ", circ)
+}
+for (round_path in round_dirs) {
+  round_name <- basename(round_path)
+  output_dir <- file.path(output_base, round_name)
+  dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+  files <- list.files(round_path, pattern = "\\.xlsx$", full.names = TRUE)
+  walk(files, ~do_leg_pca(.x, output_dir))
+}
+
+```
+
+Principal component analysis (PCA) applied to municipal elections reveals a relatively noisy structure. The first principal component typically explains around 30–40% of the total variance, indicating the absence of a dominant political axis. The individual factor maps show widely scattered points, suggesting that voting patterns vary greatly across polling stations without forming clear ideological clusters. Furthermore, preliminary checks suggest that voter turnout may drive part of the principal components, as high/low participation areas tend to align along the same direction in the PCA space. This supports the idea that local context and mobilization, rather than stable partisan alignments, play a larger role in municipal elections in Paris.
+
+```{r , warning=FALSE}
+# PCA for Municipales: Check if noise dominates or turnout explains structure
+
+input_base <- "./Municipales_processed"
+output_base <- "./PCA_results/Municipales"
+dir.create(output_base, recursive = TRUE, showWarnings = FALSE)
+
+round_dirs <- list.dirs(input_base, full.names = TRUE, recursive = FALSE)
+run_municipales_pca <- function(file_path, output_dir) {
+  df <- read_excel(file_path) %>%
+  clean_names() %>%
+  filter(!is.na(id_bvote))
+  ardt <- tools::file_path_sans_ext(basename(file_path))
+  vote_matrix <- df %>%
+    select(where(is.numeric)) %>%
+    select(-starts_with("num_")) %>%
+    mutate(across(everything(), ~replace_na(., 0))) %>%
+    as.data.frame()
+
+  if (nrow(vote_matrix) < 3 || ncol(vote_matrix) < 2) {
+    message("Skipping: ", ardt, " (too few observations)")
+    return()
+  }
+
+  rownames(vote_matrix) <- df$id_bvote
+  pca_res <- PCA(vote_matrix, graph = FALSE)
+
+  g_ind <- fviz_pca_ind(pca_res, repel = TRUE, title = paste0("Municipales PCA - ", ardt))
+  ggsave(file.path(output_dir, paste0(ardt, "_individuals.png")), g_ind, width = 6.5, height = 5)
+
+  g_scree <- fviz_eig(pca_res, addlabels = TRUE, ylim = c(0, 50))
+  ggsave(file.path(output_dir, paste0(ardt, "_screeplot.png")), g_scree, width = 6, height = 4)
+
+  write_xlsx(as.data.frame(pca_res$ind$coord), path = file.path(output_dir, paste0(ardt, "_ind_coord.xlsx")))
+}
+
+for (round_path in round_dirs) {
+  round_name <- basename(round_path)
+  output_dir <- file.path(output_base, round_name)
+  dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+
+  files <- list.files(round_path, pattern = "\\.xlsx$", full.names = TRUE)
+  walk(files, ~run_municipales_pca(.x, output_dir))
+}
+
+```
+
+In the European Parliament elections, principal component analysis (PCA) reveals that the first principal component (PC1) consistently explains only around 18% to 22% of the total variance, indicating a relatively diffuse and multidimensional voting structure. Despite the limited explanatory power of PC1, the variable plots suggest a latent opposition between candidates associated with more extreme or nationalist platforms (e.g., bardella_jordan, maréchal_marion) and those aligned with mainstream center-left parties (e.g., glucksmann_raphael, toussaint_marie), often located on opposite ends of the axis. This suggests that PC1 may still capture a “mainstream vs. radical” ideological divide, although less sharply than in other elections. Overall, the PCA highlights the fragmented and complex nature of the European election space in Paris, where no single dimension fully dominates the political landscape.
+
+```{r , warning=FALSE}
+output_dir <- "./PCA_results/Europeennes"
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+files <- list.files("./Européennes_processed", pattern = "\\.xlsx$", full.names = TRUE)
+do_europeennes_pca <- function(file_path) {
+  df <- read_excel(file_path) %>%
+  clean_names() %>%
+  filter(!is.na(id_bvote))
+  fname <- tools::file_path_sans_ext(basename(file_path))
+
+  vote_matrix <- df %>%
+    select(where(is.numeric)) %>%
+    select(-starts_with("num_"), -starts_with("geo_"), -starts_with("arrond")) %>%
+    mutate(across(everything(), ~replace_na(., 0))) %>%
+    as.data.frame()
+  rownames(vote_matrix) <- df$id_bvote
+
+  pca_res <- PCA(vote_matrix, graph = FALSE)
+
+  g_scree <- fviz_eig(pca_res, addlabels = TRUE, ylim = c(0, 50))
+  ggsave(file.path(output_dir, paste0(fname, "_screeplot.png")), g_scree, width = 6, height = 4)
+
+  g_var <- fviz_pca_var(pca_res, col.var = "contrib", repel = TRUE)
+  ggsave(file.path(output_dir, paste0(fname, "_variables.png")), g_var, width = 6.5, height = 5.5)
+
+  var_contrib <- as.data.frame(pca_res$var$contrib)
+  var_contrib$candidate <- rownames(var_contrib)
+  write_csv(var_contrib, path = file.path(output_dir, paste0(fname, "_var_contrib.csv")))
+
+  message("✓ Processed: ", fname)
+}
+
+
+walk(files, do_europeennes_pca)
+```
+
+The PCA results for the regional elections reveal a consistent regional structure in voter behavior. The first principal component explains a meaningful share of the variance across years and appears to align with a political-ideological gradient separating different types of candidates. Notably, Valérie Pécresse and Nicolas Dupont-Aignan often occupy one end of the first axis, while candidates like Pierre Laurent, Olivier Besancenot, or Julien Bayou appear on the opposite end. This suggests that the primary dimension may capture a left–right or establishment–anti-establishment divide. Moreover, when coloring individuals by region_group, distinct clustering emerges in some years, indicating the presence of territorial voting patterns, such as a contrast between Centre/North-East and South-West areas. These results confirm that regional polarization and candidate ideology jointly shape electoral variation in Paris during the regional contests.
+
+```{r , warning=FALSE}
+files <- list.files("./Régionales_processed", full.names = TRUE, pattern = "\\.xlsx$")
+output_dir <- "./PCA_results/Régionales"
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+
+do_regionales_pca <- function(file_path) {
+  df <- read_excel(file_path) %>%
+    clean_names() %>%
+    filter(!is.na(id_bvote))
+  
+  year_tour <- tools::file_path_sans_ext(basename(file_path))
+  
+  vote_matrix <- df %>%
+    column_to_rownames("id_bvote") %>%
+    select(where(is.numeric)) %>%
+    select(-starts_with("num_"), -starts_with("geo_"), -arrond) %>%
+    mutate(across(everything(), ~replace_na(., 0)))
+  
+  pca_res <- PCA(vote_matrix, graph = FALSE)
+  
+  g_ind <- fviz_pca_ind(pca_res,
+                        label = "none",
+                        geom.ind = "point",
+                        pointshape = 21,
+                        pointsize = 2,
+                        col.ind = df$region_group,
+                        palette = "jco",
+                        addEllipses = TRUE, ellipse.level = 0.8) +
+    labs(title = paste0("PCA by Region - ", year_tour))
+
+  g_var <- fviz_pca_var(pca_res, col.var = "contrib", repel = TRUE)
+  ggsave(file.path(output_dir, paste0(year_tour, "_pca_variables.png")), g_var, width = 6.5, height = 5.5)
+  
+  write_csv(as.data.frame(pca_res$var$contrib), file.path(output_dir, paste0(year_tour, "_var_contrib.csv")))
+  message("✓ Processed: ", year_tour)
+}
+
+walk(files, do_regionales_pca)
+```
+
+### Canonical Correlation Analysis (CCA)
+
+To evaluate the structural similarity between voting behaviors in the 2022 **presidential election** and the 2024 **European election**, I conducted a canonical correlation analysis (CCA) at the polling station level.
+
+The analysis yielded a series of **14 canonical correlations**, with the first few axes showing **very strong correlations**:
+
+-   Axis 1: **0.993**
+-   Axis 2: **0.968**
+-   Axis 3: **0.911**
+-   Axis 4: **0.846**
+-   Axis 5: **0.740**
+
+These values indicate that a **substantial portion of the variance in voting results from one election can be linearly predicted from the other**, suggesting a high degree of ideological and behavioral alignment across the two electoral contexts.
+
+Beyond the first few axes, the canonical correlations gradually decline (e.g., Axis 6: 0.536, Axis 10: 0.257), which is expected as deeper dimensions capture more election-specific noise or candidate-specific idiosyncrasies.
+
+This analysis confirms that **voters tend to exhibit consistent political orientations across national (présidentielles) and European (européennes) elections**, at least in the first few dominant ideological dimensions.
+
+```{r , warning=FALSE}
+library(yacca)
+pres <- read_excel("./Présidentielles_processed/vote_matrix_2022_1er.xlsx") %>% clean_names()
+euro <- read_excel("./Européennes_processed/vote_matrix_2024_1er.xlsx") %>% clean_names()
+
+common_ids <- intersect(pres$id_bvote, euro$id_bvote)
+pres <- pres %>% filter(id_bvote %in% common_ids) %>% arrange(id_bvote)
+euro <- euro %>% filter(id_bvote %in% common_ids) %>% arrange(id_bvote)
+
+pres <- pres %>% select(-tour, -arrond)
+euro <- euro %>% select(-tour, -arrond)
+
+X <- pres %>% select(where(is.numeric))
+Y <- euro %>% select(where(is.numeric))
+cca_res <- cancor(X, Y)
+output_dir <- "./PCA_results/CCA_result"
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+U <- as.matrix(X) %*% cca_res$xcoef
+V <- as.matrix(Y) %*% cca_res$ycoef
+n_axes <- length(cca_res$cor)
+for (k in 1:n_axes) {
+  u_k <- U[, k]
+  v_k <- V[, k]
+  corr_val <- round(cca_res$cor[k], 3)
+  print(corr_val)
+  png(file.path(output_dir, paste0("cca_axis", k, "_r", corr_val, ".png")), width = 800, height = 600)
+  plot(u_k, v_k,
+       xlab = paste0("Canonical Variable ", k, " (Présidentielles)"),
+       ylab = paste0("Canonical Variable ", k, " (Européennes)"),
+       main = paste0("Canonical Correlation – Axis ", k, " (r = ", corr_val, ")"),
+       pch = 20, col = "#3366CC88")
+  abline(lm(v_k ~ u_k), col = "red", lty = 2)
+  dev.off()
+}
+
+```
+
+### Feel free to combine different methods
+
+**Voting Shift Visualization (by Distance):**
+
+This arrow plot illustrates the shifts in voting preferences between the 2017 and 2022 French presidential elections for each polling station, represented in PCA space. Each arrow connects a point’s position in the 2017 PCA configuration to its position in 2022. The color gradient encodes the Euclidean shift distance: darker arrows indicate small shifts, while yellow highlights larger preference changes. Most arrows are short and cluster around the origin, implying that for a majority of polling stations, electoral preferences remained relatively stable. However, a few long arrows in the upper-right quadrant signal dramatic shifts—possibly due to candidate turnover, voter realignment, or local political mobilizations.
+
+------------------------------------------------------------------------
+
+```{r , warning=FALSE}
+library(ggrepel)
+
+df17 <- read_excel("./Présidentielles_processed/vote_matrix_2017_1er.xlsx") %>% clean_names()
+df22 <- read_excel("./Présidentielles_processed/vote_matrix_2022_1er.xlsx") %>% clean_names()
+
+common_ids <- intersect(df17$id_bvote, df22$id_bvote)
+df17 <- df17 %>% filter(id_bvote %in% common_ids) %>% arrange(id_bvote)
+df22 <- df22 %>% filter(id_bvote %in% common_ids) %>% arrange(id_bvote)
+
+X17 <- df17 %>% select(where(is.numeric)) %>% select(-starts_with("num_"))
+X22 <- df22 %>% select(where(is.numeric)) %>% select(-starts_with("num_"))
+
+pca17 <- PCA(X17, graph = FALSE)
+pca22 <- PCA(X22, graph = FALSE)
+
+coords17 <- as.data.frame(pca17$ind$coord)[, 1:2]
+coords22 <- as.data.frame(pca22$ind$coord)[, 1:2]
+coords17$id_bvote <- df17$id_bvote
+coords22$id_bvote <- df22$id_bvote
+
+merged <- left_join(coords17, coords22, by = "id_bvote", suffix = c("_2017", "_2022"))
+merged <- merged %>%
+  mutate(dx = Dim.1_2022 - Dim.1_2017,
+         dy = Dim.2_2022 - Dim.2_2017,
+         dist = sqrt(dx^2 + dy^2))
+
+ggplot(merged, aes(x = Dim.1_2017, y = Dim.2_2017)) +
+  geom_segment(aes(xend = Dim.1_2022, yend = Dim.2_2022, color = dist),
+               arrow = arrow(length = unit(0.15, "cm")),
+               alpha = 0.6) +
+  scale_color_viridis_c(option = "plasma") +
+  labs(title = "Shift in Voting Preference (2017 → 2022)", color = "Shift Distance") +
+  theme_minimal()
+
+```
+
+**Voting Shift by Region Group:**
+
+This plot disaggregates the same shift vectors by region group. Color coding shows that different geographic zones exhibit different voting dynamics. For instance, arrows from the Nord-Est and Nord-Ouest regions appear more dispersed, suggesting greater heterogeneity or volatility in those areas. In contrast, Sud-Ouest and Centre regions show denser, shorter shifts, indicating more stable patterns. This spatial structuring suggests that regional political culture or local socioeconomic factors may mediate how national political changes translate into local voting behavior.
+
+------------------------------------------------------------------------
+
+```{r , warning=FALSE}
+merged$group <- df17$region_group
+ggplot(merged, aes(x = Dim.1_2017, y = Dim.2_2017)) +
+  geom_segment(aes(xend = Dim.1_2022, yend = Dim.2_2022, color = group),
+               arrow = arrow(length = unit(0.15, "cm")),
+               alpha = 0.6) +
+  labs(title = "Voting Preference Shift by Region Group") +
+  theme_minimal()
+
+```
+
+## clustering
+
+The hierarchical clustering based on PCA results reveals four distinct clusters of voting behavior across polling stations. Cluster 1 (green) is concentrated on the left side of the PCA space, indicating a group of stations with similar preference patterns that are relatively distinct from the others. Cluster 4 (pink), by contrast, is more spread out on the right side, possibly reflecting more diverse or polarized voting tendencies. Clusters 2 and 3 occupy intermediate positions and partially overlap, suggesting transitional or mixed voting profiles.
+
+```{r , warning=FALSE}
+
+ind_coord <- as.data.frame(pca17$ind$coord[, 1:2])
+dist_mat <- dist(ind_coord)
+hc <- hclust(dist_mat, method = "ward.D2")
+fviz_dend(hc, k = 4, rect = TRUE, show_labels = FALSE)
+cluster_groups <- cutree(hc, k = 4)
+```
+
+```{r , warning=FALSE}
+fviz_pca_ind(pca17,
+             geom.ind = "point",
+             col.ind = as.factor(cluster_groups),
+             palette = "Dark2",
+             addEllipses = TRUE,
+             legend.title = "Cluster") +
+  ggtitle("PCA + Hierarchical Clustering")
+
+```
